@@ -9,22 +9,244 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+## Introduction
 
-```{r cars}
-summary(cars)
+In this project we use the data from accelerometers on the belt, forearm, arm, and dumbell of six participants to predict how well they performed the barbell lifts.  The participants were askied to perform the exercise correctly and incorrectly in 5 different ways:
+
+* Class A - exactly according to the specification
+* Class B - throwing the elbows to the front
+* Class C - lifting the dumbbell only halfway
+* Class D - lowering the dumbbell only halfway
+* Class E - throwing the hips to the front
+
+
+### Getting the data
+
+The training data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv 
+
+The test data are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv 
+
+
+## Setting up the enrivonment
+
+First, we have to load the following libraries
+
+```{r libraries}
+library(plyr)
+library(FSelector)
+library(mlbench)
+library(caret)
+library(AppliedPredictiveModeling)
+library(rpart)
+library(klaR)
+library(RWeka)
+library(randomForest)
+library(adabag)
+library(kernlab)
 ```
 
-## Including Plots
+Once that is done, we initialize the variables like so:
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r variables}
+seed <- 1337
+training_data_fraction <- 0.75
+minimum_allowed_information_gain <- 0.2
+maximum_allowed_correlation <- 0.8
+train_control <- trainControl('cv', 10)
+label <- 'classe'
+label_formula <- reformulate(termlabels = ".", response = label)
+columns_to_remove <- c(1,2,3,4,5,6,7)
+set.seed(seed)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## Loading the data
+
+The next step is to load the data set into R:
+```{r load data}
+data_from_CSV <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"),head=TRUE,sep=",",na.strings=c("", "NA"))
+```
+
+Once that is done, we remove all columns where at least one cell is empty/NA. This will reduce the number of columns in the data set from 160 to 60:
+
+```{r remove NAs}
+data_from_CSV <- data_from_CSV[ , colSums(is.na(data_from_CSV)) == 0]
+```
+
+Then we remove the columns which contain strings and/or useless information:
+
+```{r remove strings}
+data_from_CSV <- data_from_CSV[,-(columns_to_remove)]
+```
+
+This leaves us with 53 columns in our data set.
+
+
+## Removing highly correlated features
+
+In the next step we test to see whether any of the features are highly correlated (i.e. correlation higher than 0.8):
+
+```{r correlated features}
+label_column_number <- which( colnames(data_from_CSV)==label)
+correlation_matrix <- cor(data_from_CSV[,-label_column_number])
+features_with_high_correlation <- findCorrelation(correlation_matrix, cutoff=maximum_allowed_correlation, verbose = FALSE)
+
+feature_names_high_correlation <- colnames(data_from_CSV[ ,features_with_high_correlation ])
+
+```
+
+As it turns out, the following 13 features are highly correlated:
+
+```{r correlated feature names}
+# accel_belt_z
+# roll_belt
+# accel_belt_y
+# accel_dumbbell_z
+# accel_belt_x
+# pitch_belt
+# accel_arm_x
+# accel_dumbbell_x
+# magnet_arm_y
+# gyros_forearm_y
+# gyros_dumbbell_x
+# gyros_dumbbell_z
+# gyros_arm_x
+```
+
+
+So we remove them from our data set:
+
+```{r remove correlated  features}
+data_no_correlated_features = data_from_CSV[ ,-(features_with_high_correlation) ]
+```
+
+This leaves us with 40 columns in the data set.
+
+
+
+## Removing less useful features
+
+In the next step we use information gain to get the most useful features in our data set:
+
+```{r get most useful features}
+feature_weights <- information.gain(label_formula, data_no_correlated_features)
+
+features_to_keep <- feature_weights[(feature_weights[,1]>minimum_allowed_information_gain),,drop=FALSE]
+
+
+```
+
+This gives us the following features along with their information gain scores:
+```{r see most useful features}
+features_to_keep
+```
+
+We keep the most useful features and remove the rest:
+
+```{r remove less useful features}
+data_only_most_useful_features <- data_no_correlated_features[,c(rownames(features_to_keep), label)]
+```
+
+This reduces our data set to nine columns, eight of which contain features which will be used to train classifiers and one is the class label.
+
+
+## Convert features
+
+Finally, we coerce the features to the same data type:
+
+```{r convert features}
+label_column_number <- which( colnames(data_only_most_useful_features)==label)
+data_only_most_useful_features[,-label_column_number] <- sapply(data_only_most_useful_features[,-label_column_number], as.numeric)
+```
+
+
+
+## Classifier training
+
+### Splitting the data
+To train machine learning algorithms, we first have to break our data into training and testing partitions:
+
+```{r test train partitions}
+inTrain = createDataPartition(data_only_most_useful_features[[label]], p=training_data_fraction, list = FALSE)
+training = data_only_most_useful_features[ inTrain,]
+testing = data_only_most_useful_features[-inTrain,]
+```
+
+The training partition will be used to train the classifier and get the in sample accuracy and error while the testing partition will be used to get the out of sample accuracy and error.
+
+
+### Training machine learning algorithms
+
+In the next step we train four machine learning algorithms: Naive Bayes, J48 decision tree, rpart, and Random Forest.
+We also use 10-fold cross validation, in which the sample is divided into 10 parts: 9 of which are used for training and 1 for testing.  This process is repeated 10 times and the results are averaged. 
+
+```{r classifier training}
+#naive_bayes_model <- train(label_formula, data=training, method="nb", trControl=train_control)
+#J48_model <- train(label_formula, data=training, method="J48", trControl=train_control)
+#svm_polynomial_kernel_model <- train(label_formula, data=training, method="svmPoly", trControl=train_control)
+#rpart_model <- train(label_formula, data=training, method="rpart", trControl=train_control)
+random_forest_model <- train(label_formula, data=training, method="rf", trControl=train_control)
+model <- random_forest_model
+```
+
+
+### Classifier training results
+
+Finally, we use the models produced in the previous step to get in and out of sample errors and accuracies.
+
+```{r classifier training results}
+label_column_number <- which( colnames(testing)==label)
+
+training_features <- training[,-label_column_number]
+training_label <- training[,label_column_number]
+testing_features <- testing[,-label_column_number]
+testing_label <- testing[,label_column_number]
+
+model_prediction_train <- predict(model, training_features)
+model_prediction_test <- predict(model, testing_features)
+
+confusion_matrix_train <- confusionMatrix(model_prediction_train, training_label)
+confusion_matrix_test <- confusionMatrix(model_prediction_test, testing_label)
+
+in_sample_accuracy <- confusion_matrix_train$overall['Accuracy']
+out_of_sample_accuracy <- confusion_matrix_test$overall['Accuracy']
+```
+
+As can be seen from the table below, Random Forest turned out to be the most accurate classifier of the bunch, with J48 taking a second place.
+
+```{r table, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+table <- "  
+| Algorithm   | In sample Accuracy| In sample Error | Out of sample accuracy | Out of sample Error |
+|-------------|----------|--------|----------|--------|
+| Naive Bayes	|		0.698	 | 0.302	|	    0.707|     0.293|
+| J48	|		0.991  |			0.009    |   0.942    | 0.058|
+| rpart	|		0.494	|		0.506    |   0.503 |    0.497 | 
+| Random Forest  |  1.000 	|	0.000		  |  0.970    | 0.03|
+
+"
+cat(table)
+```
+
+Judging by the small out of sample error on this data set, we expect our Random Forest classifier to make very few (if any) misclassifications when used on the real world data set.
+
+
+### Running the classifier on the testing data
+
+Our random forest classifier made the following predictions on the 20 samples from the 'pml-testing.csv' file:
+
+```{r table2, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+table2 <- "  
+| Case Number:   | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10| 11| 12| 13| 14| 15| 16| 17| 18| 19| 20|
+|---------------|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Prediction:    | B | A | B | C | A | E | D | B | A | A | B | C | B | A | E | E | A | B | B | B |
+"
+cat(table2)
+```
+
+
+
